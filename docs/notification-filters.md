@@ -156,43 +156,9 @@ NOTIFY_CATEGORIES=__none__
 
 ---
 
-## 4. Dry-Run Filter Diagnostics
+## 4. Decimal USDC Threshold Normalization
 
-The filter expression parser and the amount thresholds each expose a diagnostic evaluator alongside their boolean one. Live notification filtering keeps using the boolean functions (`evaluateFilterRule`, `meetsThreshold`) and their documented allow-or-deny behavior; the diagnostic functions exist so a dry run can explain a denial without changing what a running bot sends.
+Both [`src/notifications/amount-threshold.ts`](../src/notifications/amount-threshold.ts) and [`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts) normalize equivalent decimal USDC thresholds to 7-decimal atomic units (`bigint`) before comparison:
 
-| Function | Module | Result |
-| :--- | :--- | :--- |
-| `evaluateFilterRule(rule, event)` | `src/notifications/filter-expr.ts` | `boolean` — unchanged live contract |
-| `evaluateFilterRuleDiagnostic(rule, event)` | `src/notifications/filter-expr.ts` | `{ matched, reason?, field? }` |
-| `meetsThreshold(event, thresholds)` | `src/notifications/amount-threshold.ts` | `boolean` — unchanged live contract |
-| `evaluateThresholdDiagnostic(event, thresholds)` | `src/notifications/amount-threshold.ts` | `{ passed, reason, field?, threshold? }` |
-| `evaluateFilterDryRun(rule, event, thresholds?)` | `src/notifications/filter-expr.ts` | One combined `{ matched, reason, field?, threshold? }` |
-
-### 4.1 Reason values
-
-`evaluateFilterRuleDiagnostic` reports one of:
-
-- `event-name-mismatch` — the rule names a different event than `payload.name`. The condition is not evaluated.
-- `missing-field` — a comparison referenced a field that is `undefined` or `null`. The accompanying `field` names it.
-- `predicate-false` — the field was present but the comparison (or logical expression) did not hold.
-
-`evaluateThresholdDiagnostic` reports one of:
-
-- `not-configured` — no threshold applies to this event (unset, `0`, or an unfiltered event type).
-- `passed` — the amount met the configured minimum.
-- `below-threshold` — the amount was present but smaller than the minimum.
-- `missing-field` — a threshold applies but the event's `stake`/`amount` field is absent.
-
-`evaluateFilterDryRun` runs the expression first, then the threshold, and returns `matched`, one of the expression reasons, or `below-threshold`.
-
-### 4.2 What does not change
-
-A missing field still **denies** in the live path: `evaluateFilterRule` and `meetsThreshold` both return `false`, exactly as before. Diagnostics only distinguish *why* a deny happened, which is useful when reviewing a filter against replayed or archived events:
-
-```ts
-const rule = parseFilterExpression("claim_challenged where stake >= 100 USDC");
-evaluateFilterDryRun(rule, archivedEvent, { marketChallenge: 1_000_000_000n });
-// missing stake  -> { matched: false, reason: "missing-field", field: "stake" }
-// stake = 1n     -> { matched: false, reason: "predicate-false" }
-// stake = 0.5e9  -> { matched: false, reason: "below-threshold", field: "stake", threshold: 1_000_000_000n }
-```
+- **Canonical equivalence**: Equivalent decimal strings (for example `"1"`, `"01"`, `"1.0"`, `"1.00"`, and `"1.0000000"`) normalize identically via `parseUsdcThreshold` / `normalizeUsdcThreshold` and in filter expression comparisons (both explicit `USDC` / `$` literals and bare decimal literals such as `stake >= 10.50`).
+- **Precision limit**: Values exceeding seven fractional digits (for example `"1.00000000"` or `"0.00000001"`) are rejected with `InvalidThresholdError` or `FilterParseError`.
