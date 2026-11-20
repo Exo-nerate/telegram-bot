@@ -12,9 +12,16 @@
  *   - Static field validation and type compatibility checking against known payload types.
  *   - Bounded token count (max 100 tokens) and nesting depth (max 10) to guard against
  *     hostile allocation spikes or recursion depth exhaustion before and during parsing.
+ *   - Dry-run diagnostics that report a missing payload field separately from a false
+ *     predicate (`evaluateFilterRuleDiagnostic`, `evaluateFilterDryRun`), while
+ *     `evaluateFilterRule` keeps its existing boolean allow-or-deny contract.
  */
 
 import type { DecodedEvent } from "../stellar/decode.js";
+import {
+  evaluateThresholdDiagnostic,
+  type AmountThresholds,
+} from "./amount-threshold.js";
 
 /** USDC atomic unit divisor (7 decimal places). */
 export const USDC_SCALE = 10_000_000n;
@@ -827,6 +834,58 @@ export function parseFilterExpression(input: string, options?: FilterParserOptio
 // Evaluator
 // ----------------------------------------------------
 
+/** Why a filter rule allowed or denied an event, for dry-run diagnostics. */
+export type FilterRuleDiagnosticReason =
+  | "event-name-mismatch"
+  | "missing-field"
+  | "predicate-false";
+
+/** Diagnostic result of evaluating one filter rule against one event. */
+export interface FilterRuleDiagnostic {
+  matched: boolean;
+  /** Set when `matched` is false. */
+  reason?: FilterRuleDiagnosticReason;
+  /** Payload field responsible for a `missing-field` result. */
+  field?: string;
+}
+
+/**
+ * Evaluates a parsed FilterRule and explains a denial.
+ *
+ * A comparison against an absent (or null) payload field reports
+ * `"missing-field"`; the same comparison against a present field that does
+ * not satisfy the predicate reports `"predicate-false"`. Both deny, so live
+ * allow-or-deny behavior is unchanged.
+ *
+ * @param rule The parsed filter rule.
+ * @param event The DecodedEvent to evaluate.
+ */
+export function evaluateFilterRuleDiagnostic(
+  rule: FilterRule,
+  event: DecodedEvent,
+): FilterRuleDiagnostic {
+  const payload = event.payload as Record<string, unknown>;
+
+  // Check event name match if specified
+  if (rule.eventName && rule.eventName !== payload.name) {
+    return { matched: false, reason: "event-name-mismatch" };
+  }
+
+  // If there's no condition, matching event name (or any event if unset) is enough
+  if (!rule.condition) {
+    return { matched: true };
+  }
+
+  const result = evaluateNode(rule.condition, payload);
+  if (result.matched) {
+    return { matched: true };
+  }
+  if (result.missingField !== undefined) {
+    return { matched: false, reason: "missing-field", field: result.missingField };
+  }
+  return { matched: false, reason: "predicate-false" };
+}
+
 /**
  * Evaluates a parsed FilterRule against a DecodedEvent purely (no eval, no side effects).
  *
@@ -835,41 +894,97 @@ export function parseFilterExpression(input: string, options?: FilterParserOptio
  * @returns boolean true if the event satisfies the rule, false otherwise.
  */
 export function evaluateFilterRule(rule: FilterRule, event: DecodedEvent): boolean {
-  const payload = event.payload as Record<string, unknown>;
-
-  // Check event name match if specified
-  if (rule.eventName && rule.eventName !== payload.name) {
-    return false;
-  }
-
-  // If there's no condition, matching event name (or any event if unset) is enough
-  if (!rule.condition) {
-    return true;
-  }
-
-  return evaluateNode(rule.condition, payload);
+  return evaluateFilterRuleDiagnostic(rule, event).matched;
 }
 
-function evaluateNode(node: ExprNode, payload: Record<string, unknown>): boolean {
+interface NodeResult {
+  matched: boolean;
+  /** Set when a comparison could not run because the payload field is absent. */
+  missingField?: string;
+}
+
+function evaluateNode(node: ExprNode, payload: Record<string, unknown>): NodeResult {
   if (node.type === "logical") {
     if (node.op === "and") {
-      return evaluateNode(node.left, payload) && evaluateNode(node.right, payload);
+      const left = evaluateNode(node.left, payload);
+      return left.matched ? evaluateNode(node.right, payload) : left;
     }
-    if (node.op === "or") {
-      return evaluateNode(node.left, payload) || evaluateNode(node.right, payload);
+    const left = evaluateNode(node.left, payload);
+    if (left.matched) {
+      return left;
     }
+    const right = evaluateNode(node.right, payload);
+    if (right.matched) {
+      return right;
+    }
+    // Neither branch matched. Prefer the missing field: it is the actionable
+    // difference between a false predicate and an event that lacks the field.
+    return left.missingField !== undefined ? left : right;
   }
 
   if (node.type === "comparison") {
     const rawVal = payload[node.field];
     if (rawVal === undefined || rawVal === null) {
-      return false;
+      return { matched: false, missingField: node.field };
     }
 
-    return compareValues(rawVal, node.op, node.value);
+    return { matched: compareValues(rawVal, node.op, node.value) };
   }
 
-  return false;
+  return { matched: false };
+}
+
+/** Combined dry-run outcome for expression and amount-threshold filtering. */
+export type FilterDryRunDiagnosticReason =
+  | "matched"
+  | FilterRuleDiagnosticReason
+  | "below-threshold";
+
+/** Diagnostic result of a dry-run filter evaluation. */
+export interface FilterDryRunDiagnostic {
+  matched: boolean;
+  reason: FilterDryRunDiagnosticReason;
+  /** Payload field responsible for a `missing-field` or `below-threshold` result. */
+  field?: string;
+  /** Configured minimum, in atomic 7-decimal units, for a threshold denial. */
+  threshold?: bigint;
+}
+
+/**
+ * Dry-run evaluation of a filter expression plus optional USDC thresholds.
+ *
+ * Reports one reason per event: `"matched"`, `"event-name-mismatch"`,
+ * `"missing-field"`, `"predicate-false"`, or `"below-threshold"`. The
+ * expression is evaluated first (as in the live path), then the threshold.
+ * Live callers should keep using {@link evaluateFilterRule} and
+ * {@link meetsThreshold}; this helper only adds diagnostics.
+ */
+export function evaluateFilterDryRun(
+  rule: FilterRule,
+  event: DecodedEvent,
+  thresholds?: AmountThresholds,
+): FilterDryRunDiagnostic {
+  const ruleDiagnostic = evaluateFilterRuleDiagnostic(rule, event);
+  if (!ruleDiagnostic.matched) {
+    return ruleDiagnostic.reason === "missing-field"
+      ? { matched: false, reason: "missing-field", field: ruleDiagnostic.field }
+      : { matched: false, reason: ruleDiagnostic.reason ?? "predicate-false" };
+  }
+
+  const thresholdDiagnostic = evaluateThresholdDiagnostic(event, thresholds);
+  if (!thresholdDiagnostic.passed) {
+    if (thresholdDiagnostic.reason === "missing-field") {
+      return { matched: false, reason: "missing-field", field: thresholdDiagnostic.field };
+    }
+    return {
+      matched: false,
+      reason: "below-threshold",
+      field: thresholdDiagnostic.field,
+      threshold: thresholdDiagnostic.threshold,
+    };
+  }
+
+  return { matched: true, reason: "matched" };
 }
 
 function compareValues(

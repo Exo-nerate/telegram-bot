@@ -153,3 +153,46 @@ NOTIFY_CATEGORIES=__none__
 - **`mimir-market` `claim_created` events**: Muted by `eventAllowedByCategory` because `config.notificationCategories` is non-empty (`["__none__"]`) and no real on-chain claim category matches `"__none__"`.
 - **`mimir-market` `claim_resolved` events**: Allowed and **sent**, because `NOTIFY_ENABLED=true`, `NOTIFY_MARKET=true`, and `eventAllowedByCategory` returns `true` for every event where `event.payload.name !== "claim_created"`.
 - **Other non-creation `mimir-market` events** (`claim_challenged`, `claim_cancelled`, `market_settled`, `challenger_paid`, `fee_claimed`, `withdrawal`, `withdrawal_pending`): Also pass `eventAllowedByCategory` and are **sent**, because the codebase has no per-event-type filter variable outside `claim_created`.
+
+---
+
+## 4. Dry-Run Filter Diagnostics
+
+The filter expression parser and the amount thresholds each expose a diagnostic evaluator alongside their boolean one. Live notification filtering keeps using the boolean functions (`evaluateFilterRule`, `meetsThreshold`) and their documented allow-or-deny behavior; the diagnostic functions exist so a dry run can explain a denial without changing what a running bot sends.
+
+| Function | Module | Result |
+| :--- | :--- | :--- |
+| `evaluateFilterRule(rule, event)` | `src/notifications/filter-expr.ts` | `boolean` — unchanged live contract |
+| `evaluateFilterRuleDiagnostic(rule, event)` | `src/notifications/filter-expr.ts` | `{ matched, reason?, field? }` |
+| `meetsThreshold(event, thresholds)` | `src/notifications/amount-threshold.ts` | `boolean` — unchanged live contract |
+| `evaluateThresholdDiagnostic(event, thresholds)` | `src/notifications/amount-threshold.ts` | `{ passed, reason, field?, threshold? }` |
+| `evaluateFilterDryRun(rule, event, thresholds?)` | `src/notifications/filter-expr.ts` | One combined `{ matched, reason, field?, threshold? }` |
+
+### 4.1 Reason values
+
+`evaluateFilterRuleDiagnostic` reports one of:
+
+- `event-name-mismatch` — the rule names a different event than `payload.name`. The condition is not evaluated.
+- `missing-field` — a comparison referenced a field that is `undefined` or `null`. The accompanying `field` names it.
+- `predicate-false` — the field was present but the comparison (or logical expression) did not hold.
+
+`evaluateThresholdDiagnostic` reports one of:
+
+- `not-configured` — no threshold applies to this event (unset, `0`, or an unfiltered event type).
+- `passed` — the amount met the configured minimum.
+- `below-threshold` — the amount was present but smaller than the minimum.
+- `missing-field` — a threshold applies but the event's `stake`/`amount` field is absent.
+
+`evaluateFilterDryRun` runs the expression first, then the threshold, and returns `matched`, one of the expression reasons, or `below-threshold`.
+
+### 4.2 What does not change
+
+A missing field still **denies** in the live path: `evaluateFilterRule` and `meetsThreshold` both return `false`, exactly as before. Diagnostics only distinguish *why* a deny happened, which is useful when reviewing a filter against replayed or archived events:
+
+```ts
+const rule = parseFilterExpression("claim_challenged where stake >= 100 USDC");
+evaluateFilterDryRun(rule, archivedEvent, { marketChallenge: 1_000_000_000n });
+// missing stake  -> { matched: false, reason: "missing-field", field: "stake" }
+// stake = 1n     -> { matched: false, reason: "predicate-false" }
+// stake = 0.5e9  -> { matched: false, reason: "below-threshold", field: "stake", threshold: 1_000_000_000n }
+```
