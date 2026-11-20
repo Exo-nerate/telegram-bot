@@ -18,7 +18,12 @@
  */
 
 import type { DecodedEvent } from "../stellar/decode.js";
-import { InvalidThresholdError, parseUsdcThreshold } from "./amount-threshold.js";
+import {
+  evaluateThresholdDiagnostic,
+  InvalidThresholdError,
+  parseUsdcThreshold,
+  type AmountThresholds,
+} from "./amount-threshold.js";
 
 /** USDC atomic unit divisor (7 decimal places). */
 export const USDC_SCALE = 10_000_000n;
